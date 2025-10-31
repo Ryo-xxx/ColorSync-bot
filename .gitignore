@@ -1,72 +1,18 @@
-# ========================================
-# Python general
-# ========================================
+# 環境ファイル
+.env
+
+# Python環境
 __pycache__/
-*.py[cod]
+.venv/
+*.pyc
 *.pyo
 *.pyd
-*$py.class
 
-# Virtual environment
-venv/
-env/
-.venv/
-
-# IDE / Editor settings
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# macOS / Windows junk
+# OSやエディタの一時ファイル
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
 
-# ========================================
-# Environment & credentials
-# ========================================
-.env
-.env.*
-*.env
-
-# Avoid uploading Render or deployment secrets
-*.key
-*.pem
-*.cert
-*.token
-
-# ========================================
-# Logs and runtime files
-# ========================================
-logs/
+# ログファイル
 *.log
-*.pid
-*.db
-*.sqlite3
-
-# ========================================
-# Build / distribution
-# ========================================
-dist/
-build/
-*.egg-info/
-
-# ========================================
-# Node / front-end stuff (if used)
-# ========================================
-node_modules/
-package-lock.json
-
-# ========================================
-# Backup or temporary files
-# ========================================
-*.bak
-*.tmp
-*.old
-*.orig
-
-# ========================================
-# OS-specific
-# ========================================
-desktop.ini
-
