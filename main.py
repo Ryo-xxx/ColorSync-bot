@@ -1,6 +1,10 @@
 import os
 import asyncio
 import discord  # type: ignore
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
+discord.utils.setup_logging(level=logging.INFO)
+print("[BOOT] starting app...", flush=True)
 from discord import app_commands  # type: ignore
 from discord.ext import commands  # type: ignore
 from aiohttp import web  # type: ignore
