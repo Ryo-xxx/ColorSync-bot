@@ -1,5 +1,8 @@
 # main.py
-# ColorSync-bot: Discordロールの色を外部ページから適用するボット（Render対応・aiohttp内蔵）
+# ColorSync-bot: 外部ページのカラーピッカーから個人カラーを適用するDiscordボット
+# - RenderのWebサービスで動作（PORTにバインド）
+# - GUILD_IDは「,」区切りで複数同期OK
+# - /color_web, /color_clear を提供
 
 import os
 import asyncio
@@ -11,21 +14,29 @@ from aiohttp import web
 from itsdangerous import URLSafeSerializer, BadSignature
 from dotenv import load_dotenv
 
-# ========== Env ==========
+# ========= ENV =========
 load_dotenv()
-TOKEN = os.getenv("DISCORD_BOT_TOKEN") or ""
-GUILD_ID_ENV = os.getenv("GUILD_ID", "").strip()
-GUILD_ID: Optional[int] = int(GUILD_ID_ENV) if GUILD_ID_ENV.isdigit() else None
 
-# 複数オリジン許可: カンマ区切り
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or ""
+if not TOKEN:
+    raise RuntimeError("DISCORD_BOT_TOKEN is missing.")
+
+# 複数ギルド対応（カンマ区切り）
+GUILD_IDS_RAW = os.getenv("GUILD_ID", "").strip()
+GUILD_IDS: List[int] = []
+if GUILD_IDS_RAW:
+    for x in GUILD_IDS_RAW.split(","):
+        x = x.strip()
+        if x.isdigit():
+            GUILD_IDS.append(int(x))
+
+# 複数オリジン許可（カンマ区切り）
 ALLOW_ORIGIN_RAW = os.getenv("ALLOW_ORIGIN", "https://example.com")
 ALLOW_ORIGINS: List[str] = [o.strip().rstrip("/") for o in ALLOW_ORIGIN_RAW.split(",") if o.strip()]
 
 WEB_SECRET = os.getenv("WEB_SECRET", "CHANGE_ME_TO_RANDOM_32_64_CHARS")
-# RenderのWebサービスは「PORT」にバインドしているかを監視する
 PORT = int(os.getenv("PORT", "10000"))
 
-# 重要ロール（ユーザーが触っちゃいけない系）
 def _split_csv(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
@@ -37,22 +48,20 @@ PROTECTED_ROLE_IDS: Set[int] = set(int(x) for x in _split_csv(os.getenv(
     "PROTECTED_ROLE_IDS", ""
 )) if x.isdigit())
 
-# 署名器（外部ページ→/apply で使うトークン）
 signer = URLSafeSerializer(WEB_SECRET, salt="colorsync")
 
-# ========== Discord Client ==========
+# ========= Discord Client =========
 intents = discord.Intents.default()
-intents.members = True  # メンバー取得に必要
+intents.members = True  # 個人ロール付与でメンバー取得が必要
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 PERSONAL_ROLE_PREFIX = "NameColor-"
 
-# ========== AIOHTTP ==========
+# ========= AIOHTTP =========
 routes = web.RouteTableDef()
 
 def _origin_ok(request: web.Request) -> Optional[str]:
-    """許可するOriginなら返す"""
     origin = request.headers.get("Origin", "")
     if not origin:
         return None
@@ -85,6 +94,7 @@ async def apply_color(request: web.Request):
         body = await request.json()
         token = str(body.get("t", ""))
         hexv = str(body.get("hex", "")).lstrip("#").strip()
+
         if len(hexv) != 6 or any(c not in "0123456789abcdefABCDEF" for c in hexv):
             return _with_cors(web.json_response({"ok": False, "msg": "invalid hex"}), allow)
 
@@ -108,10 +118,15 @@ async def apply_color(request: web.Request):
         except Exception:
             return _with_cors(web.json_response({"ok": False, "msg": "member not found"}, status=404), allow)
 
-    # 権限/位置チェック
+    # ボット権限チェック
     me: Optional[discord.Member] = guild.me
     if not me or not me.guild_permissions.manage_roles:
         return _with_cors(web.json_response({"ok": False, "msg": "bot lacks Manage Roles"}), allow)
+
+    # 重要ロール保護（ユーザーが保護ロールを持っていたら拒否する例）
+    for r in member.roles:
+        if r.id in PROTECTED_ROLE_IDS or r.name.lower() in PROTECTED_ROLE_NAMES:
+            return _with_cors(web.json_response({"ok": False, "msg": "protected role user; deny"}), allow)
 
     try:
         rgb = int(hexv, 16)
@@ -125,15 +140,14 @@ async def apply_color(request: web.Request):
 app = web.Application()
 app.add_routes(routes)
 
-# ========== Helpers ==========
+# ========= Helpers =========
 async def _apply_member_color(member: discord.Member, rgb_value: int, me: discord.Member):
     """個人カラー用ロールを作成/更新して付与"""
     guild = member.guild
-
     role_name = f"{PERSONAL_ROLE_PREFIX}{member.id}"
     role = discord.utils.get(guild.roles, name=role_name)
 
-    # Botのロール位置チェック（下だと編集不可）
+    # 役職位置（ボットより上のロールは編集不可）
     if role and me.top_role.position <= role.position:
         raise PermissionError("bot role must be higher than personal color role")
 
@@ -144,7 +158,7 @@ async def _apply_member_color(member: discord.Member, rgb_value: int, me: discor
             reason="Create personal color role",
             permissions=discord.Permissions.none()
         )
-        # 可能ならBotの直下に移動（失敗しても致命的ではない）
+        # 可能ならボット直下へ
         try:
             await role.edit(position=max(me.top_role.position - 1, 1))
         except Exception:
@@ -155,24 +169,25 @@ async def _apply_member_color(member: discord.Member, rgb_value: int, me: discor
         if role not in member.roles:
             await member.add_roles(role, reason="Attach personal color role")
 
-# ========== Slash Commands ==========
-@tree.command(name="color_web", description="外部ページで色を選んで『Discordへ適用』できます（個人用）")
+# ========= Slash Commands =========
+@tree.command(name="color_web", description="外部ページで色を選び『Discordへ適用』できます（個人カラー）")
 async def color_web(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user:
         await interaction.response.send_message("サーバーで実行してね。", ephemeral=True)
-        return
-    token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
-    base = ALLOW_ORIGINS[0] if ALLOW_ORIGINS else "https://example.com"
-    url = f"{base}/?t={token}"
-    view = discord.ui.View()
-    view.add_item(discord.ui.Button(label="🎨 色を選ぶ（外部ページ）", url=url))
-    await interaction.response.send_message(
-        "外部ページで色を選んで『Discordへ適用』を押してね！\n※ ボットのロール位置は、付与したいロールより上に配置しておいてね。",
-        view=view,
-        ephemeral=True
-    )
+    else:
+        token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
+        base = ALLOW_ORIGINS[0] if ALLOW_ORIGINS else "https://example.com"
+        url = f"{base}/?t={token}"  # りょーくんのページが /?t= 受け取り仕様
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="🎨 色を選ぶ（外部ページ）", url=url))
+        await interaction.response.send_message(
+            "外部ページで色を選んで『Discordへ適用』を押してね！\n"
+            "※ ボットのロール位置は、付与したいロールより上に配置しておいてね。",
+            view=view,
+            ephemeral=True
+        )
 
-@tree.command(name="color_clear", description="自分の個人カラーを削除します")
+@tree.command(name="color_clear", description="自分の個人カラー（専用ロール）を削除します")
 async def color_clear(interaction: discord.Interaction):
     if not interaction.guild or not interaction.user:
         await interaction.response.send_message("サーバーで実行してね。", ephemeral=True)
@@ -188,36 +203,36 @@ async def color_clear(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"削除に失敗: {e}", ephemeral=True)
 
-# ========== Lifecycle ==========
+# ========= Lifecycle =========
 @client.event
 async def on_ready():
     print(f"✅ Logged in as {client.user} (id={client.user.id})")
-    # ギルド限定同期（即時反映） or グローバル同期（反映に時間）
-    try:
-        if GUILD_ID:
-            guild = discord.Object(id=GUILD_ID)
-            await tree.sync(guild=guild)
-            print(f"✅ Slash commands synced to guild: {GUILD_ID}")
-        else:
+    # 複数ギルドに即時同期（グローバルは反映に時間がかかるため、基本ギルド同期推奨）
+    if GUILD_IDS:
+        for gid in GUILD_IDS:
+            try:
+                await tree.sync(guild=discord.Object(id=gid))
+                print(f"🔁 Synced commands to guild {gid}")
+            except Exception as e:
+                print(f"⚠️ Failed to sync guild {gid}: {e}")
+    else:
+        try:
             await tree.sync()
-            print("✅ Slash commands synced globally (may take time)")
-    except Exception as e:
-        print(f"❌ Slash command sync failed: {e}")
+            print("🔁 Synced commands globally (may take minutes)")
+        except Exception as e:
+            print(f"⚠️ Global sync failed: {e}")
 
-# ========== Entrypoint (Renderのポート監視に確実に応答) ==========
+# ========= Entrypoint (Render用: PORTに明示バインド) =========
 def main():
-    if not TOKEN:
-        raise RuntimeError("DISCORD_BOT_TOKEN is missing.")
-
     async def start_servers():
-        # ---- AIOHTTPを指定ポートで待機（RenderのPort Binding検出に必須）----
+        # Webサーバー起動（RenderのPort Binding検出に必須）
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
-        print(f"🌐 Web server started on port {PORT}")
+        print(f"🌐 Web server started on :{PORT}")
 
-        # ---- Discord Bot 起動 ----
+        # Discord Bot 起動
         await client.start(TOKEN)
 
     asyncio.run(start_servers())
