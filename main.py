@@ -198,11 +198,17 @@ async def on_ready():
             total = 0
             for gid in GUILD_IDS:
                 guild_obj = discord.Object(id=gid)
+
+                # ★ここが重要：グローバルに定義したコマンドを、そのギルドのツリーにコピー
+                tree.copy_global_to(guild=guild_obj)
+
+                # その上でギルド同期
                 synced = await tree.sync(guild=guild_obj)
                 total += len(synced)
                 print(f"[SYNC] guild={gid} count={len(synced)}", flush=True)
             print(f"[SYNC] done total={total}", flush=True)
         else:
+            # GUILD_ID未指定ならグローバル同期（反映に時間かかる）
             synced = await tree.sync()
             print(f"[SYNC] global count={len(synced)}（伝播に時間がかかる場合があります）", flush=True)
     except Exception as e:
