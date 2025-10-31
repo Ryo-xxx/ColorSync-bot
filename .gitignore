@@ -3,6 +3,8 @@
 # ========================================
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
 *$py.class
 
 # Virtual environment
@@ -67,3 +69,4 @@ package-lock.json
 # OS-specific
 # ========================================
 desktop.ini
+
