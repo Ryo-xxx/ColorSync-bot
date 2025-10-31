@@ -251,7 +251,7 @@ app = web.Application()
 app.add_routes(routes)
 
 # ========== スラッシュコマンド ==========
-@tree.command(name="color_web", description="外部ページで色を選べるリンクを送る（自分専用）")
+@tree.command(name="color_web", description="外部ページからロールの色を選択")
 async def color_web_cmd(interaction: discord.Interaction):
     token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
     url = f"{ALLOW_ORIGIN_RAW}?t={token}"
@@ -264,7 +264,7 @@ async def color_web_cmd(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@tree.command(name="color_set", description="既存の自分用ロールの色だけ変更（ロール名はそのまま）")
+@tree.command(name="color_set", description="既存ロールの色だけ変える")
 @app_commands.describe(hex="#RRGGBB 形式の色（例：#ff99cc）")
 async def color_set_cmd(interaction: discord.Interaction, hex: str):
     await interaction.response.defer(ephemeral=True)
@@ -277,7 +277,7 @@ async def color_set_cmd(interaction: discord.Interaction, hex: str):
     except Exception as e:
         await interaction.followup.send(f"⚠️ 変更できなかったよ：{e}", ephemeral=True)
 
-@tree.command(name="color_rename", description="既存の自分用ロールの名前を変更（短ハッシュで紐付け維持）")
+@tree.command(name="color_rename", description="ロールの名前変更")
 @app_commands.describe(name="新しく付けたいロール名（例：MyColor）")
 async def color_rename_cmd(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=True)
@@ -307,7 +307,7 @@ async def color_fixname_cmd(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ 失敗：{e}", ephemeral=True)
 
 # 管理者用：再同期（ギルドに即時反映）
-@tree.command(name="resync", description="（管理者）スラッシュコマンドを再同期する")
+@tree.command(name="resync", description="管理者用コマンド再同期")
 @app_commands.checks.has_permissions(administrator=True)
 async def resync_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
