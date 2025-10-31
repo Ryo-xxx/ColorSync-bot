@@ -1,11 +1,11 @@
 import os
 import asyncio
-import discord
-from discord import app_commands
-from discord.ext import commands
-from aiohttp import web
-from itsdangerous import URLSafeSerializer, BadSignature
-from dotenv import load_dotenv
+import discord  # type: ignore
+from discord import app_commands  # type: ignore
+from discord.ext import commands  # type: ignore
+from aiohttp import web  # type: ignore
+from itsdangerous import URLSafeSerializer, BadSignature  # type: ignore
+from dotenv import load_dotenv  # type: ignore
 from urllib.parse import urlparse
 
 # ==========
@@ -15,7 +15,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN が設定されていません。")
+    raise RuntimeError("DISCORD_BOT_TOKEN が .env にありません。")
 
 ALLOW_ORIGIN_RAW = os.getenv("ALLOW_ORIGIN", "https://example.com").strip()
 WEB_SECRET = os.getenv("WEB_SECRET", "change-me").strip()
@@ -26,7 +26,7 @@ GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 PROTECTED_ROLE_NAMES = [s.strip() for s in os.getenv("PROTECTED_ROLE_NAMES", "").split(",") if s.strip()]
 PROTECTED_ROLE_IDS = [int(s.strip()) for s in os.getenv("PROTECTED_ROLE_IDS", "").split(",") if s.strip().isdigit()]
 
-# CORSに使う "オリジン" はスキーム+ホスト部分だけ抜く（GitHub Pages のようにパスを含むURLを渡されてもOKにする）
+# CORS用: スキーム+ホストだけ抜く
 parsed = urlparse(ALLOW_ORIGIN_RAW)
 CORS_ALLOW_ORIGIN = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ALLOW_ORIGIN_RAW
 
@@ -39,11 +39,14 @@ signer = URLSafeSerializer(WEB_SECRET, salt="color")
 # Discord Bot
 # ==========
 intents = discord.Intents.default()
-intents.members = True  # メンバー取得が必要（Dev Portal で "Server Members Intent" をONにしておく）
+# メンバー取得が必要。Dev PortalのPrivileged Intents（Server Members Intent）もONにしておく
+intents.members = True
+# スラッシュコマンドだけなら他のIntentは不要
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
 # ギルド同期対象
-GUILD_IDS = []
+GUILD_IDS: list[int] = []
 if GUILD_ID_RAW:
     for s in GUILD_ID_RAW.split(","):
         s = s.strip()
@@ -60,16 +63,17 @@ async def apply_member_color(member: discord.Member, rgb_value: int):
     role_name = f"NameColor-{member.id}"
     guild = member.guild
 
-    # Botが役職を扱えるか念のためチェック
-    me = guild.me
-    if not guild.me.guild_permissions.manage_roles:
-        raise RuntimeError("Botに 'Manage Roles'（役職の管理）権限がありません。")
+    # Botの権限・階層チェック
+    me = guild.me or await guild.fetch_member(bot.user.id)  # type: ignore
+    if not me.guild_permissions.manage_roles:
+        raise RuntimeError("Botに『役職の管理(Manage Roles)』権限がありません。")
 
-    # 既存の同名ロールを取得
+    # 既存の同名ロール
     role = discord.utils.get(guild.roles, name=role_name)
 
     # 役職作成または色変更
     if role is None:
+        # 役職を最上位近くに置きたいなら後で手動でドラッグしてBotロールより下にならないようにする
         role = await guild.create_role(
             name=role_name,
             colour=discord.Colour(rgb_value),
@@ -83,6 +87,10 @@ async def apply_member_color(member: discord.Member, rgb_value: int):
         if (role.id in PROTECTED_ROLE_IDS) or (role.name in PROTECTED_ROLE_NAMES):
             raise RuntimeError("保護対象の役職には変更できません。")
         await role.edit(colour=discord.Colour(rgb_value), reason="Update personal color role")
+
+    # 役職階層の制約チェック（Botロールより上のロールは付与できない）
+    if role >= me.top_role:
+        raise RuntimeError("作成/対象ロールがBotの最上位ロール以上にあります。Botロールを上に移動してください。")
 
     # ユーザーに付与（未付与なら）
     if role not in member.roles:
@@ -128,13 +136,7 @@ async def apply(request: web.Request):
         if guild is None:
             return corsify(web.json_response({"ok": False, "msg": "guild not found"}, status=404))
 
-        member = guild.get_member(uid)
-        if member is None:
-            try:
-                member = await guild.fetch_member(uid)
-            except Exception:
-                return corsify(web.json_response({"ok": False, "msg": "member not found"}, status=404))
-
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
         # 色適用
         rgb = int(hexv, 16)
         await apply_member_color(member, rgb)
@@ -153,12 +155,13 @@ app.add_routes(routes)
 # ==========
 # スラッシュコマンド
 # ==========
-@bot.tree.command(name="color_web", description="外部ページで色を選べるリンクを送る（自分専用）")
+@tree.command(name="color_web", description="外部ページで色を選べるリンクを送る（自分専用）")
 async def color_web_cmd(interaction: discord.Interaction):
-    # 対象ギルドで同期していないとMissing Accessになる点に注意
-    token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
+    if interaction.guild is None:
+        await interaction.response.send_message("サーバー内で使ってね。", ephemeral=True)
+        return
 
-    # ALLOW_ORIGIN は「ページのフルURL」を想定。?t= を付けて渡す
+    token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
     url = f"{ALLOW_ORIGIN_RAW}?t={token}"
 
     view = discord.ui.View()
@@ -169,6 +172,25 @@ async def color_web_cmd(interaction: discord.Interaction):
         ephemeral=True
     )
 
+# 管理者向け：手動で再同期（/resync）
+@tree.command(name="resync", description="スラッシュコマンドを同期し直す（管理者）")
+@app_commands.checks.has_permissions(administrator=True)
+async def resync_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        if GUILD_IDS:
+            n = 0
+            for gid in GUILD_IDS:
+                g = discord.Object(id=gid)
+                synced = await tree.sync(guild=g)
+                n += len(synced)
+            await interaction.followup.send(f"ギルド同期を完了: {n} 件", ephemeral=True)
+        else:
+            synced = await tree.sync()
+            await interaction.followup.send(f"グローバル同期を完了: {len(synced)} 件", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"同期失敗: {e}", ephemeral=True)
+
 # ==========
 # 同期と起動
 # ==========
@@ -176,21 +198,25 @@ async def color_web_cmd(interaction: discord.Interaction):
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
 
-    # ギルド同期（速い/確実）。指定が無ければグローバル同期（数分かかることあり）
-    if GUILD_IDS:
-        for gid in GUILD_IDS:
-            try:
+    # 招待/権限のヒントをログに出す
+    print("ℹ️  招待URLは Scopes: bot + applications.commands を必ず含める。")
+    print("ℹ️  Botロールは、作成される個別色ロールより上に配置してね。（階層必須）")
+
+    # ギルド同期（速い/確実）。指定が無ければグローバル同期（伝播に時間がかかることあり）
+    try:
+        if GUILD_IDS:
+            total = 0
+            for gid in GUILD_IDS:
                 guild_obj = discord.Object(id=gid)
-                await bot.tree.sync(guild=guild_obj)
-                print(f"🌱 Synced commands to guild: {gid}")
-            except discord.HTTPException as e:
-                print(f"⚠️  Guild sync failed for {gid}: {e}")
-    else:
-        try:
-            await bot.tree.sync()
-            print("🌍 Synced commands globally")
-        except discord.HTTPException as e:
-            print(f"⚠️  Global sync failed: {e}")
+                synced = await tree.sync(guild=guild_obj)
+                total += len(synced)
+                print(f"🌱 Synced commands to guild: {gid} -> {len(synced)}")
+            print(f"✅ Guild sync done. total={total}")
+        else:
+            synced = await tree.sync()
+            print(f"🌍 Synced commands globally -> {len(synced)}（最大1時間ほど伝播することがあります）")
+    except discord.HTTPException as e:
+        print(f"⚠️  Sync failed: {e}")
 
 async def start_web():
     runner = web.AppRunner(app)
