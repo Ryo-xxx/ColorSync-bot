@@ -22,6 +22,7 @@ ALLOW_ORIGIN_RAW = os.getenv("ALLOW_ORIGIN", "https://example.com")
 ALLOW_ORIGINS: List[str] = [o.strip().rstrip("/") for o in ALLOW_ORIGIN_RAW.split(",") if o.strip()]
 
 WEB_SECRET = os.getenv("WEB_SECRET", "CHANGE_ME_TO_RANDOM_32_64_CHARS")
+# RenderのWebサービスは「PORT」にバインドしているかを監視する
 PORT = int(os.getenv("PORT", "10000"))
 
 # 重要ロール（ユーザーが触っちゃいけない系）
@@ -129,35 +130,27 @@ async def _apply_member_color(member: discord.Member, rgb_value: int, me: discor
     """個人カラー用ロールを作成/更新して付与"""
     guild = member.guild
 
-    # 重要ロールの保護（念のため）
-    for r in member.roles:
-        if (r.id in PROTECTED_ROLE_IDS) or (r.name.lower() in PROTECTED_ROLE_NAMES):
-            # 個人カラー用ロールの操作だけなので阻止はしないが、念のため位置/権限だけチェック
-            pass
-
     role_name = f"{PERSONAL_ROLE_PREFIX}{member.id}"
     role = discord.utils.get(guild.roles, name=role_name)
 
-    # Botのロール位置チェック
+    # Botのロール位置チェック（下だと編集不可）
     if role and me.top_role.position <= role.position:
         raise PermissionError("bot role must be higher than personal color role")
 
     if not role:
-        # 新規作成
         role = await guild.create_role(
             name=role_name,
             colour=discord.Colour(rgb_value),
             reason="Create personal color role",
             permissions=discord.Permissions.none()
         )
-        # 位置をBotの一つ下あたりに動かす（失敗しても致命的ではない）
+        # 可能ならBotの直下に移動（失敗しても致命的ではない）
         try:
             await role.edit(position=max(me.top_role.position - 1, 1))
         except Exception:
             pass
         await member.add_roles(role, reason="Attach personal color role")
     else:
-        # 既存更新
         await role.edit(colour=discord.Colour(rgb_value), reason="Update personal color role")
         if role not in member.roles:
             await member.add_roles(role, reason="Attach personal color role")
@@ -169,7 +162,6 @@ async def color_web(interaction: discord.Interaction):
         await interaction.response.send_message("サーバーで実行してね。", ephemeral=True)
         return
     token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
-    # ALLOW_ORIGINSの先頭に飛ばす（?t=）
     base = ALLOW_ORIGINS[0] if ALLOW_ORIGINS else "https://example.com"
     url = f"{base}/?t={token}"
     view = discord.ui.View()
@@ -200,8 +192,7 @@ async def color_clear(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     print(f"✅ Logged in as {client.user} (id={client.user.id})")
-
-    # ギルド限定同期（即時反映） or グローバル同期（反映まで時間かかる）
+    # ギルド限定同期（即時反映） or グローバル同期（反映に時間）
     try:
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -213,16 +204,23 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Slash command sync failed: {e}")
 
-def _run_web(loop: asyncio.AbstractEventLoop):
-    loop.create_task(web._run_app(app, host="0.0.0.0", port=PORT))
-    print(f"🌐 Web server will listen on :{PORT}")
-
+# ========== Entrypoint (Renderのポート監視に確実に応答) ==========
 def main():
     if not TOKEN:
         raise RuntimeError("DISCORD_BOT_TOKEN is missing.")
-    loop = asyncio.get_event_loop()
-    _run_web(loop)
-    client.run(TOKEN)
+
+    async def start_servers():
+        # ---- AIOHTTPを指定ポートで待機（RenderのPort Binding検出に必須）----
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        print(f"🌐 Web server started on port {PORT}")
+
+        # ---- Discord Bot 起動 ----
+        await client.start(TOKEN)
+
+    asyncio.run(start_servers())
 
 if __name__ == "__main__":
     main()
