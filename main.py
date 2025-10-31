@@ -1,6 +1,8 @@
+# main.py
 import os
 import asyncio
 import re
+import hashlib
 from typing import Optional, List
 
 import discord  # type: ignore
@@ -48,9 +50,36 @@ if GUILD_ID_RAW:
         if s.isdigit():
             GUILD_IDS.append(int(s))
 
-# ========== 共通ユーティリティ ==========
-ID_SUFFIX_PATTERN = re.compile(r"-([0-9]{15,25})$")  # ロール末尾の -<user_id> を特定
+# ========== 命名規則（新方式：短いハッシュで紐付け） ==========
+# 旧方式   : "<任意名>-<user_id>"（末尾が18桁前後の数字）
+# 新方式   : "<任意名>-<hash6>"   （uid と WEB_SECRET から作る6桁ハッシュ）
+# 目的     : 見た目にIDを出さずに「誰のロールか」特定できるようにする
+ID_SUFFIX_PATTERN = re.compile(r"-([0-9]{15,25})$")           # 旧方式の検出
+HASH_SUFFIX_PATTERN = re.compile(r"-([0-9a-f]{6})$", re.I)    # 新方式の検出
 
+def uid_hash6(uid: int) -> str:
+    raw = f"{uid}:{WEB_SECRET}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:6]
+
+def pretty_role_name(name: str) -> str:
+    """末尾の -<id> / -<hash6> を見た目から取り除いた表示用"""
+    if ID_SUFFIX_PATTERN.search(name):
+        return ID_SUFFIX_PATTERN.sub("", name)
+    if HASH_SUFFIX_PATTERN.search(name):
+        return HASH_SUFFIX_PATTERN.sub("", name)
+    return name
+
+def new_personal_name(base: str, uid: int) -> str:
+    """ユーザー入力の表示名に短ハッシュを付ける（100文字制限を考慮）"""
+    suffix = "-" + uid_hash6(uid)
+    base = base.strip()
+    # 100文字超えないようにトリム（Discordのロール名上限は100）
+    max_base = 100 - len(suffix)
+    if len(base) > max_base:
+        base = base[:max_base]
+    return base + suffix
+
+# ========== 共通ユーティリティ ==========
 def is_protected(role: discord.Role) -> bool:
     return role.id in PROTECTED_ROLE_IDS or role.name in PROTECTED_ROLE_NAMES
 
@@ -64,30 +93,38 @@ def ensure_manageable(guild: discord.Guild, role: discord.Role):
     if is_protected(role):
         raise RuntimeError("保護対象のロールは変更できません。")
 
-def personal_role_name_for(member: discord.Member, base: Optional[str] = None) -> str:
-    """
-    個人ロールの命名規則：
-    - 末尾に必ず `-<user_id>` を付与して本人と紐付け
-    - base を渡せば `base-<id>`、None の場合は既存検出用
-    """
-    if base is None:
-        base = "NameColor"
-    return f"{base}-{member.id}"
-
 def find_personal_role(member: discord.Member) -> Optional[discord.Role]:
     """
-    ユーザーIDで終わるロールを探す（*-<user_id>）
-    ロール名がリネームされても末尾IDで追跡可能
+    このメンバーの「個人色ロール」を特定する。
+    優先順：
+      1) 末尾が -<hash6> で、hash6(uid) と一致
+      2) 末尾が -<user_id>（旧方式）
+    まずはメンバー所持ロールを見て、無ければギルド全体から検索。
     """
-    suffix = f"-{member.id}"
-    for r in member.guild.roles:
-        if r.name.endswith(suffix):
+    gid_hash = uid_hash6(member.id)
+
+    # まずは所持ロールから
+    for r in member.roles:
+        n = r.name
+        if n.endswith("-" + gid_hash):
             return r
+        if n.endswith("-" + str(member.id)):
+            return r
+
+    # 念のためギルド全体からも探す
+    for r in member.guild.roles:
+        n = r.name
+        if n.endswith("-" + gid_hash):
+            return r
+        if n.endswith("-" + str(member.id)):
+            return r
+
     return None
 
 async def create_or_update_personal_role(member: discord.Member, rgb_value: int) -> discord.Role:
     """
     既存があれば色更新、なければ作成する（/color_web 用）
+    新規作成時は NameColor-<hash6> で作る。
     """
     guild = member.guild
     me = guild.me
@@ -96,9 +133,9 @@ async def create_or_update_personal_role(member: discord.Member, rgb_value: int)
 
     role = find_personal_role(member)
     if role is None:
-        # 新規作成（デフォルト名は NameColor-<id>）
+        role_name = new_personal_name("NameColor", member.id)
         role = await guild.create_role(
-            name=personal_role_name_for(member, "NameColor"),
+            name=role_name,
             colour=discord.Colour(rgb_value),
             permissions=discord.Permissions.none(),
             reason="Create personal color role",
@@ -128,19 +165,32 @@ async def update_only_color(member: discord.Member, rgb_value: int) -> discord.R
 
 async def rename_personal_role(member: discord.Member, new_base_name: str) -> discord.Role:
     """
-    個人ロールの表示名を変更（末尾の -<user_id> は維持して特定性を担保）
+    個人ロールの表示名を変更。
+    ・旧方式（-<id>）で持っていても、新方式（-<hash6>）名に統一。
     """
     role = find_personal_role(member)
     if role is None:
         raise RuntimeError("あなたの個人ロールが見つかりません。まずは /color_web で作成してね。")
     ensure_manageable(member.guild, role)
 
-    # 末尾IDは維持して先頭を入れ替え
-    new_name = f"{new_base_name}-{member.id}"
-    if len(new_name) > 100:
-        raise RuntimeError("ロール名が長すぎます（100文字以内）")
-
+    new_name = new_personal_name(new_base_name, member.id)
     await role.edit(name=new_name, reason="Rename personal color role")
+    return role
+
+async def migrate_personal_role_name(member: discord.Member) -> Optional[discord.Role]:
+    """
+    旧式名（…-<id>）を見つけたら、新方式（…-<hash6>）へ付け替える。
+    """
+    role = find_personal_role(member)
+    if role is None:
+        return None
+
+    # 旧式なら置き換え
+    if role.name.endswith("-" + str(member.id)):
+        vis = pretty_role_name(role.name)  # 旧名から末尾を外した見た目
+        new_name = new_personal_name(vis or "NameColor", member.id)
+        ensure_manageable(member.guild, role)
+        await role.edit(name=new_name, reason="Migrate role name to hash suffix")
     return role
 
 # ========== AIOHTTP (API) ==========
@@ -183,7 +233,12 @@ async def apply(request: web.Request):
 
         rgb = int(hexv, 16)
         role = await create_or_update_personal_role(member, rgb)
-        return corsify(web.json_response({"ok": True, "msg": f"applied #{hexv.lower()}", "role": role.name}))
+        return corsify(web.json_response({
+            "ok": True,
+            "msg": f"applied #{hexv.lower()}",
+            "role": role.name,
+            "display": pretty_role_name(role.name),
+        }))
 
     except BadSignature:
         return corsify(web.json_response({"ok": False, "msg": "invalid token"}, status=400))
@@ -216,22 +271,40 @@ async def color_set_cmd(interaction: discord.Interaction, hex: str):
     try:
         rgb = int(hex.lstrip("#"), 16)
         role = await update_only_color(interaction.user, rgb)
-        await interaction.followup.send(f"✅ ロール **{role.name}** の色を `{hex}` に変更したよ。", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ ロール **{pretty_role_name(role.name)}** の色を `{hex}` に変更したよ。", ephemeral=True
+        )
     except Exception as e:
         await interaction.followup.send(f"⚠️ 変更できなかったよ：{e}", ephemeral=True)
 
-@tree.command(name="color_rename", description="既存の自分用ロールの名前を変更（末尾のIDは維持）")
+@tree.command(name="color_rename", description="既存の自分用ロールの名前を変更（短ハッシュで紐付け維持）")
 @app_commands.describe(name="新しく付けたいロール名（例：MyColor）")
 async def color_rename_cmd(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=True)
     try:
-        # 末尾IDは自動付与するので、ユーザー入力には ID を含めない想定
-        if ID_SUFFIX_PATTERN.search(name):
-            raise RuntimeError("末尾に -<id> を含めない名前を入力してね。ID部分は自動で付きます。")
+        # 末尾に -<id> / -<hash> を入れる必要はない（自動付与）
+        if ID_SUFFIX_PATTERN.search(name) or HASH_SUFFIX_PATTERN.search(name):
+            raise RuntimeError("末尾の -<何か> は付けないでOK！純粋なロール名だけ入れてね。")
         role = await rename_personal_role(interaction.user, name)
-        await interaction.followup.send(f"✅ ロール名を **{role.name}** に変更したよ。", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ ロール名を **{pretty_role_name(role.name)}** に変更したよ。", ephemeral=True
+        )
     except Exception as e:
         await interaction.followup.send(f"⚠️ 変更できなかったよ：{e}", ephemeral=True)
+
+@tree.command(name="color_fixname", description="旧式（-ID）名のロールを新方式（-ハッシュ）名に整理する")
+async def color_fixname_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        role = await migrate_personal_role_name(interaction.user)
+        if role is None:
+            await interaction.followup.send("色ロールが見つからないよ。まずは /color_web から作ってね。", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"✅ ロール名を **{pretty_role_name(role.name)}** に整理したよ。", ephemeral=True
+            )
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 失敗：{e}", ephemeral=True)
 
 # 管理者用：再同期（ギルドに即時反映）
 @tree.command(name="resync", description="（管理者）スラッシュコマンドを再同期する")
