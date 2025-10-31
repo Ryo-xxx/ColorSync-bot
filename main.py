@@ -1,80 +1,104 @@
 import os
 import asyncio
-import logging
-from urllib.parse import urlparse
+import re
+from typing import Optional, List
 
 import discord  # type: ignore
 from discord import app_commands  # type: ignore
 from discord.ext import commands  # type: ignore
+
 from aiohttp import web  # type: ignore
 from itsdangerous import URLSafeSerializer, BadSignature  # type: ignore
 from dotenv import load_dotenv  # type: ignore
+from urllib.parse import urlparse
 
-# -----------------------------
-# Logging (Renderに確実に出す)
-# -----------------------------
-logging.basicConfig(level=logging.INFO, force=True)
-discord.utils.setup_logging(level=logging.INFO)
-print("[BOOT] starting app...", flush=True)
-
-# -----------------------------
-# 環境変数
-# -----------------------------
-load_dotenv()  # ローカル実行時のみ有効。Renderでは無視される想定。
+# ========== 環境変数 ==========
+load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("DISCORD_BOT_TOKEN が .env/環境変数にありません。")
+    raise RuntimeError("DISCORD_BOT_TOKEN が設定されていません。Render の Environment に設定して再デプロイしてね。")
 
 ALLOW_ORIGIN_RAW = os.getenv("ALLOW_ORIGIN", "https://example.com").strip()
 WEB_SECRET = os.getenv("WEB_SECRET", "change-me").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()  # カンマ区切り可
+GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
 PROTECTED_ROLE_NAMES = [s.strip() for s in os.getenv("PROTECTED_ROLE_NAMES", "").split(",") if s.strip()]
 PROTECTED_ROLE_IDS = [int(s.strip()) for s in os.getenv("PROTECTED_ROLE_IDS", "").split(",") if s.strip().isdigit()]
 
-# CORS: スキーム+ホストのみ
+# ページのオリジンだけ抽出（パスがついてもOKにする）
 parsed = urlparse(ALLOW_ORIGIN_RAW)
 CORS_ALLOW_ORIGIN = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ALLOW_ORIGIN_RAW
 
-# 署名器（外部ページ→Discord用トークン）
+# ========== 署名器 ==========
 signer = URLSafeSerializer(WEB_SECRET, salt="color")
 
-# -----------------------------
-# Discord Bot 準備
-# -----------------------------
+# ========== Bot 基本 ==========
 intents = discord.Intents.default()
-intents.members = True  # 個別ロール付与で必要（Dev PortalのServer Members IntentもONに）
+intents.members = True  # Server Members Intent を Dev Portal で ON
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-GUILD_IDS: list[int] = []
+# ギルド同期対象（あれば高速反映）
+GUILD_IDS: List[int] = []
 if GUILD_ID_RAW:
     for s in GUILD_ID_RAW.split(","):
         s = s.strip()
         if s.isdigit():
             GUILD_IDS.append(int(s))
 
-# -----------------------------
-# 色ロール付与ロジック
-# -----------------------------
-async def apply_member_color(member: discord.Member, rgb_value: int):
+# ========== 共通ユーティリティ ==========
+ID_SUFFIX_PATTERN = re.compile(r"-([0-9]{15,25})$")  # ロール末尾の -<user_id> を特定
+
+def is_protected(role: discord.Role) -> bool:
+    return role.id in PROTECTED_ROLE_IDS or role.name in PROTECTED_ROLE_NAMES
+
+def ensure_manageable(guild: discord.Guild, role: discord.Role):
+    """Botがそのロールを編集できるか（階層と権限）をチェック"""
+    me = guild.me
+    if not me.guild_permissions.manage_roles:
+        raise RuntimeError("Botに 'Manage Roles' 権限がありません。")
+    if role >= me.top_role:
+        raise RuntimeError("Botのロール位置が対象ロール以下です。サーバー設定でBotロールを上に移動してください。")
+    if is_protected(role):
+        raise RuntimeError("保護対象のロールは変更できません。")
+
+def personal_role_name_for(member: discord.Member, base: Optional[str] = None) -> str:
     """
-    ユーザー専用の色役職 NameColor-<user_id> を作成/更新し、ユーザーに付与する。
+    個人ロールの命名規則：
+    - 末尾に必ず `-<user_id>` を付与して本人と紐付け
+    - base を渡せば `base-<id>`、None の場合は既存検出用
+    """
+    if base is None:
+        base = "NameColor"
+    return f"{base}-{member.id}"
+
+def find_personal_role(member: discord.Member) -> Optional[discord.Role]:
+    """
+    ユーザーIDで終わるロールを探す（*-<user_id>）
+    ロール名がリネームされても末尾IDで追跡可能
+    """
+    suffix = f"-{member.id}"
+    for r in member.guild.roles:
+        if r.name.endswith(suffix):
+            return r
+    return None
+
+async def create_or_update_personal_role(member: discord.Member, rgb_value: int) -> discord.Role:
+    """
+    既存があれば色更新、なければ作成する（/color_web 用）
     """
     guild = member.guild
-    me = guild.me or await guild.fetch_member(bot.user.id)  # type: ignore
-
+    me = guild.me
     if not me.guild_permissions.manage_roles:
-        raise RuntimeError("Botに『役職の管理(Manage Roles)』権限がありません。")
+        raise RuntimeError("Botに 'Manage Roles' 権限がありません。")
 
-    role_name = f"NameColor-{member.id}"
-    role = discord.utils.get(guild.roles, name=role_name)
-
+    role = find_personal_role(member)
     if role is None:
+        # 新規作成（デフォルト名は NameColor-<id>）
         role = await guild.create_role(
-            name=role_name,
+            name=personal_role_name_for(member, "NameColor"),
             colour=discord.Colour(rgb_value),
             permissions=discord.Permissions.none(),
             reason="Create personal color role",
@@ -82,26 +106,50 @@ async def apply_member_color(member: discord.Member, rgb_value: int):
             mentionable=False,
         )
     else:
-        if (role.id in PROTECTED_ROLE_IDS) or (role.name in PROTECTED_ROLE_NAMES):
-            raise RuntimeError("保護対象の役職には変更できません。")
-        await role.edit(colour=discord.Colour(rgb_value), reason="Update personal color role")
+        ensure_manageable(guild, role)
+        await role.edit(colour=discord.Colour(rgb_value), reason="Update personal color")
 
-    # 役職階層チェック（Botより上は付与不可）
-    if role >= me.top_role:
-        raise RuntimeError("作成/対象ロールがBotの最上位ロール以上です。サーバー設定でBotロールを上に移動してください。")
-
+    # 未付与なら付ける
     if role not in member.roles:
         await member.add_roles(role, reason="Attach personal color role")
 
-# -----------------------------
-# AIOHTTP (Web API)
-# -----------------------------
+    return role
+
+async def update_only_color(member: discord.Member, rgb_value: int) -> discord.Role:
+    """
+    既存ロールが無いときはエラーにする「色だけ変更」用
+    """
+    role = find_personal_role(member)
+    if role is None:
+        raise RuntimeError("あなたの個人ロールが見つかりません。まずは /color_web で作成してね。")
+    ensure_manageable(member.guild, role)
+    await role.edit(colour=discord.Colour(rgb_value), reason="Update personal color (only)")
+    return role
+
+async def rename_personal_role(member: discord.Member, new_base_name: str) -> discord.Role:
+    """
+    個人ロールの表示名を変更（末尾の -<user_id> は維持して特定性を担保）
+    """
+    role = find_personal_role(member)
+    if role is None:
+        raise RuntimeError("あなたの個人ロールが見つかりません。まずは /color_web で作成してね。")
+    ensure_manageable(member.guild, role)
+
+    # 末尾IDは維持して先頭を入れ替え
+    new_name = f"{new_base_name}-{member.id}"
+    if len(new_name) > 100:
+        raise RuntimeError("ロール名が長すぎます（100文字以内）")
+
+    await role.edit(name=new_name, reason="Rename personal color role")
+    return role
+
+# ========== AIOHTTP (API) ==========
 routes = web.RouteTableDef()
 
 def corsify(resp: web.StreamResponse) -> web.StreamResponse:
     resp.headers["Access-Control-Allow-Origin"] = CORS_ALLOW_ORIGIN
     resp.headers["Access-Control-Allow-Headers"] = "content-type"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
     return resp
 
 @routes.get("/")
@@ -116,7 +164,7 @@ async def preflight(_: web.Request):
 async def apply(request: web.Request):
     """
     JSON: { "t": "<signed token>", "hex": "#RRGGBB" }
-    token = signer.dumps({ "g": guild_id, "u": user_id })
+    tokenは { "g": guild_id, "u": user_id } を署名したもの
     """
     try:
         data = await request.json()
@@ -134,8 +182,8 @@ async def apply(request: web.Request):
         member = guild.get_member(uid) or await guild.fetch_member(uid)
 
         rgb = int(hexv, 16)
-        await apply_member_color(member, rgb)
-        return corsify(web.json_response({"ok": True, "msg": f"applied #{hexv.lower()}"}))
+        role = await create_or_update_personal_role(member, rgb)
+        return corsify(web.json_response({"ok": True, "msg": f"applied #{hexv.lower()}", "role": role.name}))
 
     except BadSignature:
         return corsify(web.json_response({"ok": False, "msg": "invalid token"}, status=400))
@@ -147,15 +195,9 @@ async def apply(request: web.Request):
 app = web.Application()
 app.add_routes(routes)
 
-# -----------------------------
-# スラッシュコマンド
-# -----------------------------
+# ========== スラッシュコマンド ==========
 @tree.command(name="color_web", description="外部ページで色を選べるリンクを送る（自分専用）")
 async def color_web_cmd(interaction: discord.Interaction):
-    if interaction.guild is None:
-        await interaction.response.send_message("サーバー内で使ってね。", ephemeral=True)
-        return
-
     token = signer.dumps({"g": interaction.guild.id, "u": interaction.user.id})
     url = f"{ALLOW_ORIGIN_RAW}?t={token}"
 
@@ -167,65 +209,80 @@ async def color_web_cmd(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@tree.command(name="resync", description="スラッシュコマンドを同期し直す（管理者）")
+@tree.command(name="color_set", description="既存の自分用ロールの色だけ変更（ロール名はそのまま）")
+@app_commands.describe(hex="#RRGGBB 形式の色（例：#ff99cc）")
+async def color_set_cmd(interaction: discord.Interaction, hex: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        rgb = int(hex.lstrip("#"), 16)
+        role = await update_only_color(interaction.user, rgb)
+        await interaction.followup.send(f"✅ ロール **{role.name}** の色を `{hex}` に変更したよ。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 変更できなかったよ：{e}", ephemeral=True)
+
+@tree.command(name="color_rename", description="既存の自分用ロールの名前を変更（末尾のIDは維持）")
+@app_commands.describe(name="新しく付けたいロール名（例：MyColor）")
+async def color_rename_cmd(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        # 末尾IDは自動付与するので、ユーザー入力には ID を含めない想定
+        if ID_SUFFIX_PATTERN.search(name):
+            raise RuntimeError("末尾に -<id> を含めない名前を入力してね。ID部分は自動で付きます。")
+        role = await rename_personal_role(interaction.user, name)
+        await interaction.followup.send(f"✅ ロール名を **{role.name}** に変更したよ。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 変更できなかったよ：{e}", ephemeral=True)
+
+# 管理者用：再同期（ギルドに即時反映）
+@tree.command(name="resync", description="（管理者）スラッシュコマンドを再同期する")
 @app_commands.checks.has_permissions(administrator=True)
 async def resync_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        if GUILD_IDS:
-            total = 0
-            for gid in GUILD_IDS:
-                g = discord.Object(id=gid)
-                synced = await tree.sync(guild=g)
-                total += len(synced)
-            await interaction.followup.send(f"ギルド同期を完了: {total} 件", ephemeral=True)
-        else:
-            synced = await tree.sync()
-            await interaction.followup.send(f"グローバル同期を完了: {len(synced)} 件（反映に時間がかかることがあります）", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"同期失敗: {e}", ephemeral=True)
-
-# -----------------------------
-# 起動時処理（同期）
-# -----------------------------
-@bot.event
-async def on_ready():
-    print(f"[READY] {bot.user} ({bot.user.id})", flush=True)
-    print("ℹ️  招待URLは Scopes: bot + applications.commands を必ず含める。", flush=True)
-    print("ℹ️  Botロールを作成ロールより上に配置（Manage Roles権限も付与）。", flush=True)
+    await interaction.response.defer(ephemeral=True)
     try:
         if GUILD_IDS:
             total = 0
             for gid in GUILD_IDS:
                 guild_obj = discord.Object(id=gid)
-
-                # ★ここが重要：グローバルに定義したコマンドを、そのギルドのツリーにコピー
                 tree.copy_global_to(guild=guild_obj)
+                synced = await tree.sync(guild=guild_obj)
+                total += len(synced)
+            await interaction.followup.send(f"🔄 再同期しました（合計 {total} 件）", ephemeral=True)
+        else:
+            synced = await tree.sync()
+            await interaction.followup.send(f"🔄 グローバル {len(synced)} 件を再同期しました（反映に時間がかかる場合あり）", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ 失敗：{e}", ephemeral=True)
 
-                # その上でギルド同期
+# ========== 起動時処理 ==========
+@bot.event
+async def on_ready():
+    print(f"[READY] {bot.user} ({bot.user.id})", flush=True)
+    try:
+        if GUILD_IDS:
+            total = 0
+            for gid in GUILD_IDS:
+                guild_obj = discord.Object(id=gid)
+                tree.copy_global_to(guild=guild_obj)
                 synced = await tree.sync(guild=guild_obj)
                 total += len(synced)
                 print(f"[SYNC] guild={gid} count={len(synced)}", flush=True)
             print(f"[SYNC] done total={total}", flush=True)
         else:
-            # GUILD_ID未指定ならグローバル同期（反映に時間かかる）
             synced = await tree.sync()
-            print(f"[SYNC] global count={len(synced)}（伝播に時間がかかる場合があります）", flush=True)
+            print(f"[SYNC] global count={len(synced)}", flush=True)
     except Exception as e:
         print("[SYNC-ERROR]", e, flush=True)
 
-# -----------------------------
-# Webサーバ & Bot起動
-# -----------------------------
 async def start_web():
-    print(f"[WEB] binding :{PORT}", flush=True)
+    print("[WEB] binding :10000", flush=True)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    print(f"[WEB] started :{PORT}", flush=True)
+    print("[WEB] started :10000", flush=True)
 
 async def main():
+    print("[BOOT] starting app...", flush=True)
     await start_web()
     await bot.start(TOKEN)
 
